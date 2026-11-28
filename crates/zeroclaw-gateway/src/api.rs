@@ -1798,21 +1798,32 @@ pub async fn handle_api_sessions_list(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
+    if state.session_backend.is_none() {
         return Json(serde_json::json!({
             "sessions": [],
             "message": "Session persistence is disabled"
         }))
         .into_response();
-    };
+    }
 
+    Json(serde_json::json!({ "sessions": legacy_session_list(&state, true) })).into_response()
+}
+
+pub(crate) fn legacy_session_list(
+    state: &AppState,
+    include_webchat: bool,
+) -> Vec<serde_json::Value> {
+    let Some(backend) = &state.session_backend else {
+        return Vec::new();
+    };
     // Include every session that's attributable (agent_alias stamped,
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
     let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
+    all_metadata
         .into_iter()
+        .filter(|meta| include_webchat || !meta.key.starts_with(GW_SESSION_PREFIX))
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
         .map(|meta| {
             // Resolve owning agent: prefer the stamped alias, otherwise
@@ -1848,9 +1859,7 @@ pub async fn handle_api_sessions_list(
             }
             entry
         })
-        .collect();
-
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+        .collect()
 }
 
 /// Resolve a path `{id}` to the persisted session key.
@@ -5786,7 +5795,7 @@ pub(crate) mod tests {
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         let device_id = "dev-1".to_string();
         registry
             .register(
@@ -5821,7 +5830,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reconcile_backfills_orphan_token_hashes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let registry = DeviceRegistry::new(tmp.path());
+        let registry = DeviceRegistry::new(tmp.path()).unwrap();
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
@@ -5885,7 +5894,7 @@ pub(crate) mod tests {
         assert!(pairing.is_authenticated(&token));
 
         // Simulate the `/pair` orphan: token is paired but never registered.
-        let registry = DeviceRegistry::new(&data_dir);
+        let registry = DeviceRegistry::new(&data_dir).unwrap();
         assert_eq!(registry.device_count(), 0);
 
         let inserted = registry
@@ -6339,7 +6348,7 @@ pub(crate) mod tests {
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing

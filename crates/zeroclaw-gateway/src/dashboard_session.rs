@@ -841,6 +841,16 @@ impl DashboardAuth {
         })
     }
 
+    pub(crate) fn chat_grants(&self, session: &SessionAuth) -> Option<ResolvedGrants> {
+        if session.ended_now().is_some() {
+            return None;
+        }
+        self.inbound
+            .current_grants(&session.connection)
+            .ok()
+            .filter(crate::dashboard_core::may_chat)
+    }
+
     /// Check again, from a long-lived socket, the session a request admitted
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
@@ -1403,6 +1413,7 @@ pub(crate) struct SessionWatch {
     /// grants a chat needs and that agent, as the upgrade checked them, or
     /// the socket closes as an administrator's does on demotion.
     chat_agent: Option<String>,
+    require_same_grants: bool,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1440,6 +1451,7 @@ impl SessionWatch {
             session,
             require_admin,
             chat_agent: None,
+            require_same_grants: false,
             recheck,
             pending: None,
             stopping,
@@ -1457,6 +1469,17 @@ impl SessionWatch {
     ) -> Self {
         let mut watch = Self::new(auth, session, false, state);
         watch.chat_agent = Some(agent.to_string());
+        watch
+    }
+
+    pub(crate) fn for_acp_chat(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        agent: &str,
+        state: &AppState,
+    ) -> Self {
+        let mut watch = Self::for_chat(auth, session, agent, state);
+        watch.require_same_grants = true;
         watch
     }
 
@@ -1510,6 +1533,9 @@ impl SessionWatch {
     /// operator stream; for a scoped chat, the session grants a chat needs
     /// and its agent.
     fn still_admits(&self, session: &SessionAuth) -> bool {
+        if self.require_same_grants && self.session.grants != session.grants {
+            return false;
+        }
         if self.require_admin && !session.is_admin() {
             return false;
         }
@@ -2887,6 +2913,23 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(set_cookies(&response).is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_page_sign_in_returns_the_notice_to_the_dashboard() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let notice = "4494e230-198b-4eb8-b8e3-b9037249ffc8";
+        let path = format!("/auth/sign-in/corp?return=%2Fchat%3Fthread%3D1%23turn&notice={notice}");
+        let started = start(&fixture, &path).await;
+        mount_token(&server, &started.nonce, true).await;
+        let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION].to_str().unwrap(),
+            format!("/chat?thread=1#turn#zeroclaw-signed-in={notice}")
+        );
+        assert!(cookie_from(&response, SESSION_COOKIE).is_some());
     }
 
     #[tokio::test]
@@ -4752,6 +4795,111 @@ mod tests {
         (status, json(response).await)
     }
 
+    #[tokio::test]
+    async fn voice_write_rechecks_cookie_permissions_after_body_admission() {
+        for demote in [true, false] {
+            let server = idp(&["admins", "ops"], "gw").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = sign_in_config(&server.uri());
+            config.config_path = tmp.path().join("config.toml");
+            config.data_dir = tmp.path().join("data");
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let fixture = fixture_with(
+                config.clone(),
+                Arc::clone(&pairing),
+                Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc))),
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed = sign_in(&fixture, &server).await;
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()).unwrap());
+            registry
+                .reconcile_from_token_hashes(&pairing.tokens())
+                .unwrap();
+            let device = registry.list().unwrap().pop().unwrap();
+            let state = AppState {
+                device_registry: Some(Arc::clone(&registry)),
+                ..fixture.state.clone()
+            };
+            let router = Router::new()
+                .route(
+                    "/api/devices/{id}/voice",
+                    axum::routing::put(crate::api_pairing::put_device_voice_preferences)
+                        .get(crate::api_pairing::get_device_voice_preferences),
+                )
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&fixture.auth),
+                    },
+                    layer,
+                ));
+            let path = format!("/api/devices/{}/voice", device.id);
+            let (paced, started, chunks) = paced_body();
+            let req = request_with_body(
+                "PUT",
+                &path,
+                &[
+                    ("cookie", &signed.cookie_header()),
+                    ("origin", OWN_ORIGIN),
+                    (CSRF_HEADER, &signed.csrf),
+                    ("content-type", "application/json"),
+                ],
+                paced,
+            );
+            let pending_router = router.clone();
+            let pending =
+                zeroclaw_spawn::spawn!(async move { pending_router.oneshot(req).await.unwrap() });
+            started.await.unwrap();
+            let commit = state.begin_config_commit().await.unwrap();
+            let next = if demote {
+                test_support::without_admin_mapping(&config)
+            } else {
+                config.clone()
+            };
+            commit
+                .publish(commit.next_revision().unwrap(), next.clone())
+                .unwrap();
+            rpc.publish_accepted(&next, rpc.accepted_revision() + 1)
+                .unwrap();
+            drop(commit);
+            let prefs = crate::api_pairing::VoicePreferences {
+                dictation: true,
+                ..Default::default()
+            };
+            chunks
+                .send(axum::body::Bytes::from(serde_json::to_vec(&prefs).unwrap()))
+                .unwrap();
+            drop(chunks);
+            let response = pending.await.unwrap();
+            assert_eq!(
+                response.status(),
+                if demote {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let saved = send(
+                &router,
+                request(
+                    "GET",
+                    &path,
+                    loopback(),
+                    &[("authorization", "Bearer zc_paired")],
+                ),
+            )
+            .await;
+            let saved = json(saved).await;
+            assert_eq!(saved["preferences"]["dictation"], !demote, "{saved}");
+        }
+    }
+
     async fn check_cookie_device_write_after_publication(rotate: bool) {
         enum Change {
             Demote,
@@ -4777,7 +4925,7 @@ mod tests {
                 Arc::new(DashboardSessions::default()),
             );
             let signed = sign_in(&fixture, &server).await;
-            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()));
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()).unwrap());
             registry
                 .reconcile_from_token_hashes(&pairing.tokens())
                 .unwrap();
